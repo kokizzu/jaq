@@ -231,7 +231,7 @@ checksum = "af150ab688ff2122fcef229be89cb50dd66af9e01a4ff320cc137eecc9bacc38"
 
 [[package]]
 name = "jaq"
-version = "1.6.0"
+version = "2.0.0-beta"
 dependencies = [
  "atty",
  "clap",
@@ -239,9 +239,9 @@ dependencies = [
  "env_logger",
  "hifijson",
  "jaq-core",
- "jaq-interpret",
+ "jaq-json",
  "jaq-std",
- "jaq-syn",
+ "log",
  "memmap2",
  "mimalloc",
  "tempfile",
@@ -251,37 +251,30 @@ dependencies = [
 
 [[package]]
 name = "jaq-core"
-version = "1.5.1"
+version = "2.0.0-beta"
 dependencies = [
- "aho-corasick",
- "base64",
- "chrono",
- "hifijson",
- "jaq-interpret",
- "jaq-syn",
- "libm",
- "log",
- "regex",
+ "dyn-clone",
+ "jaq-json",
+ "once_cell",
  "serde_json",
- "urlencoding",
+ "typed-arena",
 ]
 
 [[package]]
-name = "jaq-interpret"
-version = "1.5.0"
+name = "jaq-json"
+version = "1.0.0-beta"
 dependencies = [
  "ahash",
- "dyn-clone",
  "hifijson",
  "indexmap",
- "jaq-syn",
- "once_cell",
+ "jaq-core",
+ "jaq-std",
  "serde_json",
 ]
 
 [[package]]
 name = "jaq-play"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "aho-corasick",
  "codesnake",
@@ -289,9 +282,8 @@ dependencies = [
  "getrandom",
  "hifijson",
  "jaq-core",
- "jaq-interpret",
+ "jaq-json",
  "jaq-std",
- "jaq-syn",
  "js-sys",
  "log",
  "unicode-width",
@@ -301,19 +293,19 @@ dependencies = [
 
 [[package]]
 name = "jaq-std"
-version = "1.6.0"
+version = "2.0.0-beta"
 dependencies = [
+ "aho-corasick",
+ "base64",
+ "chrono",
+ "hifijson",
  "jaq-core",
- "jaq-interpret",
- "jaq-syn",
+ "jaq-json",
+ "libm",
+ "log",
+ "regex",
  "serde_json",
-]
-
-[[package]]
-name = "jaq-syn"
-version = "1.6.0"
-dependencies = [
- "serde",
+ "urlencoding",
 ]
 
 [[package]]
@@ -574,6 +566,12 @@ checksum = "be55cf8942feac5c765c2c993422806843c9a9a45d4d5c407ad6dd2ea95eb9b6"
 dependencies = [
  "winapi-util",
 ]
+
+[[package]]
+name = "typed-arena"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6af6ae20167a9ece4bcb41af5b80f8a1f1df981f6391189ce00fd257af04126a"
 
 [[package]]
 name = "unicode-ident"

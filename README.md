@@ -1,11 +1,11 @@
 # jaq
 
 ![Build status](https://github.com/01mf02/jaq/workflows/Rust/badge.svg)
-[![Crates.io](https://img.shields.io/crates/v/jaq-interpret.svg)](https://crates.io/crates/jaq-interpret)
-[![Documentation](https://docs.rs/jaq-interpret/badge.svg)](https://docs.rs/jaq-interpret)
+[![Crates.io](https://img.shields.io/crates/v/jaq-core.svg)](https://crates.io/crates/jaq-core)
+[![Documentation](https://docs.rs/jaq-core/badge.svg)](https://docs.rs/jaq-core)
 [![Rust 1.64+](https://img.shields.io/badge/rust-1.64+-orange.svg)](https://www.rust-lang.org)
 
-jaq (pronounced like *Jacques*[^jacques]) is a clone of the JSON data processing tool [jq].
+jaq (pronounced /ʒaːk/, like *Jacques*[^jacques]) is a clone of the JSON data processing tool [jq].
 jaq aims to support a large subset of jq's syntax and operations.
 
 You can try jaq online on the [jaq playground](https://gedenkt.at/jaq/).
@@ -217,6 +217,7 @@ Here is an overview that summarises:
 - [x] if-then-else (`if .a < .b then .a else .b end`)
 - [x] Folding (`reduce .[] as $x (0; . + $x)`, `foreach .[] as $x (0; . + $x; . + .)`)
 - [x] Error handling (`try ... catch ...`) (see the [differences from jq](#error-handling))
+- [x] Breaking (`label $x | f | ., break $x`)
 - [x] String interpolation (`"The successor of \(.) is \(.+1)."`)
 - [x] Format strings (`@json`, `@text`, `@csv`, `@tsv`, `@html`, `@sh`, `@base64`, `@base64d`)
 
@@ -262,6 +263,7 @@ Here is an overview that summarises:
 - [x] String <-> integers (`explode`, `implode`)
 - [x] String normalisation (`ascii_downcase`, `ascii_upcase`)
 - [x] String prefix/postfix (`startswith`, `endswith`, `ltrimstr`, `rtrimstr`)
+- [x] String whitespace trimming (`trim`, `ltrim`, `rtrim`)
 - [x] String splitting (`split("foo")`)
 - [x] Array filters (`reverse`, `sort`, `sort_by(-.)`, `group_by`, `min_by`, `max_by`)
 - [x] Stream consumers (`first`, `last`, `range`, `fold`)
@@ -367,11 +369,16 @@ Three-argument filters that ignore `.`:
 
 </details>
 
+## Modules
+
+- [x] `include "path";`
+- [x] `import "path" as mod;`
+- [x] `import "path" as $data;`
+
 ## Advanced features
 
 jaq currently does *not* aim to support several features of jq, such as:
 
-- Modules
 - SQL-style operators
 - Streaming
 
@@ -574,8 +581,9 @@ $ jaq -n --arg x 1 --arg y 2 '$x, $y, $ARGS.named'
 ## Folding
 
 jq and jaq provide filters
-`reduce xs as $x (init; f)` and
-`foreach xs as $x (init; f)`.
+`reduce xs as $x (init; update)`,
+`foreach xs as $x (init; update)`, and.
+`foreach xs as $x (init; update; project)`.
 
 In jaq, the output of these filters is defined very simply:
 Assuming that `xs` evaluates to `x0`, `x1`, ..., `xn`,
@@ -597,22 +605,6 @@ init
 | xn as $x | f | (.,
 empty)...)
 ~~~
-
-Additionally, jaq provides the filter `for xs as $x (init; f)` that evaluates to
-
-~~~ text
-init
-| ., (x0 as $x | f
-| ...
-| ., (xn as $x | f
-)...)
-~~~
-
-The difference between `foreach` and `for` is that
-`for` yields the output of `init`, whereas `foreach` omits it.
-For example,
-`foreach (1, 2, 3) as $x (0; .+$x)` yields `1, 3, 6`, whereas
-`for (1, 2, 3) as $x (0; .+$x)` yields `0, 1, 3, 6`.
 
 The interpretation of `reduce`/`foreach` in jaq has the following advantages over jq:
 
@@ -640,55 +632,6 @@ The interpretation of `reduce`/`foreach` in jaq has the following advantages ove
   </details>
 * It makes the implementation of `reduce` and `foreach`
   special cases of the same code, reducing the potential for bugs.
-
-Compared to `foreach ...`, the filter `for ...`
-(where `...` refers to `xs as $x (init; f)`)
-has a stronger relationship with `reduce`.
-In particular,
-the values yielded by `reduce ...` are a subset of
-the values yielded by `for ...`.
-This does not hold if you replace `for` by `foreach`.
-<details><summary>Example</summary>
-
-As an example, if we set `...` to `empty as $x (0; .+$x)`, then
-`foreach ...` yields no value, whereas
-`for ...` and `reduce ...` yield `0`.
-
-</details>
-
-Furthermore, jq provides the filter
-`foreach xs as $x (init; f; proj)` (`foreach/3`) and interprets
-`foreach xs as $x (init; f)` (`foreach/2`) as
-`foreach xs as $x (init; f; .)`, whereas
-jaq does *not* provide `foreach/3` because
-it requires completely separate logic from `foreach/2` and `reduce`
-in both the parser and the interpreter.
-
-
-## Error handling
-
-In jq, the `try f catch g` expression breaks out of the `f` stream as
-soon as an error occurs, ceding control to `g` after that. This is
-mentioned in its manual as a possible mechanism for breaking out of
-loops
-([here](https://jqlang.github.io/jq/manual/#breaking-out-of-control-structures)). jaq
-however doesn't interrupt the `f` stream, but instead sends _each_
-error value emitted to the `g` filter; the result is a stream of
-values emitted from `f` with values emitted from `g` interspersed
-where errors occurred.
-
-Consider the following example: this expression is `true` in jq,
-because the first `error(2)` interrupts the stream:
-
-```jq
-[try (1, error(2), 3, error(4)) catch .] == [1, 2]
-```
-
-In jaq however, this holds:
-
-```jq
-[try (1, error(2), 3, error(4)) catch .] == [1, 2, 3, 4]
-```
 
 
 ## Miscellaneous
@@ -723,6 +666,14 @@ In jaq however, this holds:
   in jq, `join(x)` converts all elements of the input array to strings and intersperses them with `x`, whereas
   in jaq, `join(x)` simply calculates `x0 + x + x1 + x + ... + xn`.
   When all elements of the input array and `x` are strings, jq and jaq yield the same output.
+* Modules:
+  If the `-L` command-line option is not given, the search path for modules and data files
+  in jq is `["~/.jq", "$ORIGIN/../lib/jq", "$ORIGIN/../lib"]`, whereas
+  in jaq, it is `[]`.
+  However, this can be emulated in jaq by setting an alias such as
+  `alias jaq="jaq -L ~ -L \`which jaq\`/../lib/jq -L \`which jaq\`/../lib"`.
+  Furthermore, jq expands `~` and `$ORIGIN` at the beginning of search paths, whereas
+  jaq does not perform such an expansion.
 
 
 

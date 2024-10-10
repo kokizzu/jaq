@@ -1,7 +1,7 @@
 [package]
 name = "jaq-play"
 description = "Web interface for jaq"
-version = "0.1.0"
+version = "0.0.0"
 authors = ["Michael Färber <michael.faerber@gedenkt.at>"]
 categories = ["wasm"]
 readme = "README.md"
@@ -16,10 +16,10 @@ wasm-opt = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-jaq-syn       = { version = "1.1.0", path = "../jaq-syn" }
-jaq-interpret = { version = "1.2.0", path = "../jaq-interpret" }
-jaq-core      = { version = "1.2.0", path = "../jaq-core" }
-jaq-std       = { version = "1.2.0", path = "../jaq-std" }
+jaq-core = { version = "2.0.0-beta", path = "../jaq-core" }
+jaq-std  = { version = "2.0.0-beta", path = "../jaq-std" }
+jaq-json = { version = "1.0.0-beta", path = "../jaq-json" }
+
 aho-corasick = "1.1.2"
 codesnake = { version = "0.2" }
 hifijson = "0.2"

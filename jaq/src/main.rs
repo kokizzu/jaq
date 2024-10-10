@@ -1,9 +1,12 @@
 use clap::{Parser, ValueEnum};
 use core::fmt::{self, Display, Formatter};
-use jaq_interpret::{Ctx, Filter, FilterT, ParseCtx, RcIter, Val};
+use jaq_core::{compile, load, Ctx, Native, RcIter};
+use jaq_json::Val;
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Termination};
+
+type Filter = jaq_core::Filter<Native<Val>>;
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
@@ -84,6 +87,12 @@ struct Cli {
     #[arg(short, long, value_name = "FILE")]
     from_file: Option<PathBuf>,
 
+    /// Search for modules and data in given directory
+    ///
+    /// If this option is given multiple times, all given directories are searched.
+    #[arg(short = 'L', value_name = "DIR")]
+    search_paths: Vec<PathBuf>,
+
     /// Set variable `$<a>` to string `<v>`
     #[arg(long, value_names = &["a", "v"])]
     arg: Vec<String>,
@@ -124,8 +133,12 @@ impl ColorWhen {
 fn main() -> ExitCode {
     use env_logger::Env;
     env_logger::Builder::from_env(Env::default().filter_or("LOG", "debug"))
-        // omit name of module that emitted log message
-        .format_target(false)
+        .format(|buf, record| match record.level() {
+            // format error messages (yielded by `stderr`) without newline
+            log::Level::Error => write!(buf, "{}", record.args()),
+            // format debug messages such as `["DEBUG:", [1, 2, 3]]`
+            level => writeln!(buf, "[\"{}:\", {}]", level, record.args()),
+        })
         .init();
 
     let cli = Cli::parse();
@@ -156,19 +169,25 @@ fn real_main(cli: &Cli) -> Result<ExitCode, Error> {
         return Ok(run_tests(std::fs::File::open(test_file)?));
     }
 
-    let (vars, ctx) = binds(cli)?.into_iter().unzip();
+    let (vars, mut ctx): (Vec<String>, Vec<Val>) = binds(cli)?.into_iter().unzip();
 
     let mut args = cli.args.iter();
-    let filter = match &cli.from_file {
-        Some(file) => Some(std::fs::read_to_string(file)?),
-        None => args.next().cloned(),
+    let file = match &cli.from_file {
+        Some(path) => Some((
+            path.as_path().display().to_string(),
+            std::fs::read_to_string(path)?,
+        )),
+        None => args.next().cloned().map(|code| ("<inline>".into(), code)),
     };
     let files: Vec<_> = args.collect();
 
-    let filter = match filter {
-        None => Filter::default(),
-        Some(filter_str) => parse(&filter_str, vars).map_err(|e| Error::Report(filter_str, e))?,
+    let (vals, filter) = match file {
+        None => (Vec::new(), Filter::default()),
+        Some((path, code)) => {
+            parse(&path, &code, &vars, &cli.search_paths).map_err(Error::Report)?
+        }
     };
+    ctx.extend(vals);
     //println!("Filter: {:?}", filter);
 
     let last = if files.is_empty() {
@@ -177,7 +196,7 @@ fn real_main(cli: &Cli) -> Result<ExitCode, Error> {
     } else {
         let mut last = None;
         for file in files {
-            let path = std::path::Path::new(file);
+            let path = Path::new(file);
             let file = load_file(path).map_err(|e| Error::Io(Some(file.to_string()), e))?;
             let inputs = read_slice(cli, &file);
             if cli.in_place {
@@ -232,18 +251,16 @@ fn binds(cli: &Cli) -> Result<Vec<(String, Val)>, Error> {
     bind(&mut var_val, &cli.arg, |v| {
         Ok(Val::Str(v.to_string().into()))
     })?;
-    bind(&mut var_val, &cli.rawfile, |f| {
-        let s = std::fs::read_to_string(f).map_err(|e| Error::Io(Some(f.to_string()), e));
+    bind(&mut var_val, &cli.rawfile, |path| {
+        let s = std::fs::read_to_string(path).map_err(|e| Error::Io(Some(path.to_string()), e));
         Ok(Val::Str(s?.into()))
     })?;
-    bind(&mut var_val, &cli.slurpfile, |f| {
-        let path = std::path::Path::new(f);
-        let file = load_file(path).map_err(|e| Error::Io(Some(f.to_string()), e))?;
-        Ok(Val::arr(json_slice(&file).collect::<Result<Vec<_>, _>>()?))
+    bind(&mut var_val, &cli.slurpfile, |path| {
+        json_array(path).map_err(|e| Error::Io(Some(path.to_string()), e))
     })?;
 
     var_val.push(("ARGS".to_string(), args_named(&var_val)));
-    let env = std::env::vars().map(|(k, v)| (k.into(), Val::str(v)));
+    let env = std::env::vars().map(|(k, v)| (k.into(), Val::from(v)));
     var_val.push(("ENV".to_string(), Val::obj(env.collect())));
 
     Ok(var_val)
@@ -257,45 +274,65 @@ fn args_named(var_val: &[(String, Val)]) -> Val {
     Val::obj(args.collect())
 }
 
-fn parse_term(filter_str: &str) -> Result<jaq_syn::Main, Vec<Report>> {
-    let tokens = jaq_syn::Lexer::new(filter_str).lex().map_err(|errs| {
-        errs.into_iter()
-            .map(|e| report_lex(filter_str, e))
-            .collect::<Vec<_>>()
-    })?;
+fn parse(
+    path: &str,
+    code: &str,
+    vars: &[String],
+    paths: &[PathBuf],
+) -> Result<(Vec<Val>, Filter), Vec<FileReports>> {
+    use compile::Compiler;
+    use load::{import, Arena, File, Loader};
 
-    let main = jaq_syn::Parser::new(&tokens).parse(|p| p.module(|p| p.term()));
-    let main = main.map_err(|errs| {
-        //std::println!("{:?}", errs);
-        errs.into_iter()
-            .map(|e| report_parse(filter_str, e))
-            .collect::<Vec<_>>()
-    })?;
+    let vars: Vec<_> = vars.iter().map(|v| format!("${v}")).collect();
+    let arena = Arena::default();
+    let loader = Loader::new(jaq_std::defs().chain(jaq_json::defs())).with_std_read(paths);
+    let path = path.into();
+    let modules = loader
+        .load(&arena, File { path, code })
+        .map_err(load_errors)?;
 
-    //std::println!("{:?}", main);
-    Ok(main.conv(filter_str))
+    let mut vals = Vec::new();
+    import(&modules, |p| {
+        let path = p.find(paths, "json")?;
+        vals.push(json_array(path).map_err(|e| e.to_string())?);
+        Ok(())
+    })
+    .map_err(load_errors)?;
+
+    let compiler = Compiler::default()
+        .with_funs(jaq_std::funs().chain(jaq_json::funs()))
+        .with_global_vars(vars.iter().map(|v| &**v));
+    let filter = compiler.compile(modules).map_err(compile_errors)?;
+    Ok((vals, filter))
 }
 
-fn parse(filter_str: &str, vars: Vec<String>) -> Result<Filter, Vec<Report>> {
-    let mut ctx = ParseCtx::new(vars);
-    ctx.insert_natives(jaq_core::core());
-    ctx.insert_defs(jaq_std::std());
-    let filter = parse_term(filter_str)?;
-    let filter = ctx.compile(filter);
-    if ctx.errs.is_empty() {
-        Ok(filter)
-    } else {
-        let reports = ctx.errs.into_iter().map(|error| Report {
-            message: error.0.to_string(),
-            labels: Vec::from([(error.1, [(error.0.to_string(), None)].into(), Color::Red)]),
-        });
-        Err(reports.collect())
-    }
+fn load_errors(errs: load::Errors<&str>) -> Vec<FileReports> {
+    use load::Error;
+
+    let errs = errs.into_iter().map(|(file, err)| {
+        let code = file.code;
+        let err = match err {
+            Error::Io(errs) => errs.into_iter().map(|e| report_io(code, e)).collect(),
+            Error::Lex(errs) => errs.into_iter().map(|e| report_lex(code, e)).collect(),
+            Error::Parse(errs) => errs.into_iter().map(|e| report_parse(code, e)).collect(),
+        };
+        (file.map_code(|s| s.into()), err)
+    });
+    errs.collect()
+}
+
+fn compile_errors(errs: compile::Errors<&str>) -> Vec<FileReports> {
+    let errs = errs.into_iter().map(|(file, errs)| {
+        let code = file.code;
+        let errs = errs.into_iter().map(|e| report_compile(code, e)).collect();
+        (file.map_code(|s| s.into()), errs)
+    });
+    errs.collect()
 }
 
 /// Try to load file by memory mapping and fall back to regular loading if it fails.
-fn load_file(path: &std::path::Path) -> io::Result<Box<dyn core::ops::Deref<Target = [u8]>>> {
-    let file = std::fs::File::open(path)?;
+fn load_file(path: impl AsRef<Path>) -> io::Result<Box<dyn core::ops::Deref<Target = [u8]>>> {
+    let file = std::fs::File::open(path.as_ref())?;
     match unsafe { memmap2::Mmap::map(&file) } {
         Ok(mmap) => Ok(Box::new(mmap)),
         Err(_) => Ok(Box::new(std::fs::read(path)?)),
@@ -323,25 +360,27 @@ fn json_read<'a>(read: impl BufRead + 'a) -> impl Iterator<Item = io::Result<Val
     })
 }
 
+fn json_array(path: impl AsRef<Path>) -> io::Result<Val> {
+    json_slice(&load_file(path.as_ref())?).collect()
+}
+
 fn read_buffered<'a, R>(cli: &Cli, read: R) -> Box<dyn Iterator<Item = io::Result<Val>> + 'a>
 where
     R: BufRead + 'a,
 {
     if cli.raw_input {
-        Box::new(raw_input(cli.slurp, read).map(|r| r.map(Val::str)))
+        Box::new(raw_input(cli.slurp, read).map(|r| r.map(Val::from)))
     } else {
-        let vals = json_read(read);
-        Box::new(collect_if(cli.slurp, vals, Val::arr))
+        Box::new(collect_if(cli.slurp, json_read(read)))
     }
 }
 
 fn read_slice<'a>(cli: &Cli, slice: &'a [u8]) -> Box<dyn Iterator<Item = io::Result<Val>> + 'a> {
     if cli.raw_input {
         let read = io::BufReader::new(slice);
-        Box::new(raw_input(cli.slurp, read).map(|r| r.map(Val::str)))
+        Box::new(raw_input(cli.slurp, read).map(|r| r.map(Val::from)))
     } else {
-        let vals = json_slice(slice);
-        Box::new(collect_if(cli.slurp, vals, Val::arr))
+        Box::new(collect_if(cli.slurp, json_slice(slice)))
     }
 }
 
@@ -358,25 +397,25 @@ where
     }
 }
 
-fn collect_if<'a, T: 'a, E: 'a>(
+fn collect_if<'a, T: FromIterator<T> + 'a, E: 'a>(
     slurp: bool,
     iter: impl Iterator<Item = Result<T, E>> + 'a,
-    f: impl FnOnce(Vec<T>) -> T,
 ) -> Box<dyn Iterator<Item = Result<T, E>> + 'a> {
     if slurp {
-        let slurped: Result<Vec<_>, _> = iter.collect();
-        Box::new(core::iter::once(slurped.map(f)))
+        Box::new(core::iter::once(iter.collect()))
     } else {
         Box::new(iter)
     }
 }
 
+type FileReports = (load::File<String>, Vec<Report>);
+
 #[derive(Debug)]
 enum Error {
     Io(Option<String>, io::Error),
-    Report(String, Vec<Report>),
+    Report(Vec<FileReports>),
     Parse(String),
-    Jaq(jaq_interpret::Error),
+    Jaq(jaq_core::Error<Val>),
     Persist(tempfile::PersistError),
     FalseOrNull,
     NoOutput,
@@ -398,12 +437,15 @@ impl Termination for Error {
                 eprintln!("Error: {e}");
                 2
             }
-            Self::Report(code, reports) => {
-                let idx = codesnake::LineIndex::new(&code);
-                for e in reports {
-                    eprintln!("Error: {}", e.message);
-                    let block = e.into_block(&idx);
-                    eprintln!("{}\n{}{}", block.prologue(), block, block.epilogue())
+            Self::Report(file_reports) => {
+                for (file, reports) in file_reports {
+                    let idx = codesnake::LineIndex::new(&file.code);
+                    for e in reports {
+                        eprintln!("Error: {}", e.message);
+                        let block = e.into_block(&idx);
+                        eprintln!("{}[{}]", block.prologue(), file.path);
+                        eprintln!("{}{}", block, block.epilogue())
+                    }
                 }
                 3
             }
@@ -453,6 +495,7 @@ fn run(
         let input = item.map_err(Error::Parse)?;
         //println!("Got {:?}", input);
         for output in filter.run((ctx.clone(), input)) {
+            use jaq_core::ValT;
             let output = output.map_err(Error::Jaq)?;
             last = Some(output.as_bool());
             f(output)?;
@@ -511,13 +554,8 @@ where
 fn fmt_val(f: &mut Formatter, opts: &PpOpts, level: usize, v: &Val) -> fmt::Result {
     use yansi::Paint;
     match v {
-        Val::Null => "null".fmt(f),
-        Val::Bool(b) => b.fmt(f),
-        Val::Int(i) => i.fmt(f),
-        Val::Float(x) if x.is_finite() => write!(f, "{x:?}"),
-        Val::Float(_) => "null".fmt(f),
-        Val::Num(n) => n.fmt(f),
-        Val::Str(s) => write!(f, "{:?}", s.green()),
+        Val::Null | Val::Bool(_) | Val::Int(_) | Val::Float(_) | Val::Num(_) => v.fmt(f),
+        Val::Str(_) => write!(f, "{}", v.green()),
         Val::Arr(a) => {
             '['.bold().fmt(f)?;
             if !a.is_empty() {
@@ -599,12 +637,19 @@ impl Color {
     }
 }
 
-fn report_lex(code: &str, (expected, found): jaq_syn::lex::Error<&str>) -> Report {
-    use jaq_syn::lex::{span, Expect};
+fn report_io(code: &str, (path, error): (&str, String)) -> Report {
+    let path_range = load::span(code, path);
+    Report {
+        message: format!("could not load file {}: {}", path, error),
+        labels: [(path_range, [(error, None)].into(), Color::Red)].into(),
+    }
+}
+
+fn report_lex(code: &str, (expected, found): load::lex::Error<&str>) -> Report {
     // truncate found string to its first character
     let found = &found[..found.char_indices().nth(1).map_or(found.len(), |(i, _)| i)];
 
-    let found_range = span(code, found);
+    let found_range = load::span(code, found);
     let found = match found {
         "" => [("unexpected end of input".to_string(), None)].into(),
         c => [("unexpected character ", None), (c, Some(Color::Red))]
@@ -614,10 +659,10 @@ fn report_lex(code: &str, (expected, found): jaq_syn::lex::Error<&str>) -> Repor
     let label = (found_range, found, Color::Red);
 
     let labels = match expected {
-        Expect::Delim(open) => {
+        load::lex::Expect::Delim(open) => {
             let text = [("unclosed delimiter ", None), (open, Some(Color::Yellow))]
                 .map(|(s, c)| (s.into(), c));
-            Vec::from([(span(code, open), text.into(), Color::Yellow), label])
+            Vec::from([(load::span(code, open), text.into(), Color::Yellow), label])
         }
         _ => Vec::from([label]),
     };
@@ -628,14 +673,29 @@ fn report_lex(code: &str, (expected, found): jaq_syn::lex::Error<&str>) -> Repor
     }
 }
 
-fn report_parse(code: &str, (expected, found): jaq_syn::parse::TError<&str>) -> Report {
-    use jaq_syn::lex::Token;
-    let found_range = jaq_syn::lex::span(code, Token::opt_as_str(found, code));
-    let found = found.map_or("unexpected end of input", |_| "unexpected token");
+fn report_parse(code: &str, (expected, found): load::parse::Error<&str>) -> Report {
+    let found_range = load::span(code, found);
+
+    let found = if found.is_empty() {
+        "unexpected end of input"
+    } else {
+        "unexpected token"
+    };
     let found = [(found.to_string(), None)].into();
 
     Report {
         message: format!("expected {}", expected.as_str()),
+        labels: Vec::from([(found_range, found, Color::Red)]),
+    }
+}
+
+fn report_compile(code: &str, (found, undefined): compile::Error<&str>) -> Report {
+    let found_range = load::span(code, found);
+    let message = format!("undefined {}", undefined.as_str());
+    let found = [(message.clone(), None)].into();
+
+    Report {
+        message,
         labels: Vec::from([(found_range, found, Color::Red)]),
     }
 }
@@ -663,11 +723,11 @@ impl Report {
     }
 }
 
-fn run_test(test: jaq_syn::test::Test<String>) -> Result<(Val, Val), Error> {
-    let inputs = RcIter::new(Box::new(core::iter::empty()));
-    let ctx = Ctx::new(Vec::new(), &inputs);
+fn run_test(test: load::test::Test<String>) -> Result<(Val, Val), Error> {
+    let (ctx, filter) = parse("", &test.filter, &[], &[]).map_err(Error::Report)?;
 
-    let filter = parse(&test.filter, Vec::new()).map_err(|e| Error::Report(test.filter, e))?;
+    let inputs = RcIter::new(Box::new(core::iter::empty()));
+    let ctx = Ctx::new(ctx, &inputs);
 
     let json = |s: String| {
         use hifijson::token::Lex;
@@ -676,14 +736,14 @@ fn run_test(test: jaq_syn::test::Test<String>) -> Result<(Val, Val), Error> {
             .map_err(invalid_data)
     };
     let input = json(test.input)?;
-    let expect: Result<Vec<_>, _> = test.output.into_iter().map(json).collect();
-    let obtain: Result<Vec<_>, _> = filter.run((ctx, input)).collect();
-    Ok((Val::arr(expect?), Val::arr(obtain.map_err(Error::Jaq)?)))
+    let expect: Result<Val, _> = test.output.into_iter().map(json).collect();
+    let obtain: Result<Val, _> = filter.run((ctx, input)).collect();
+    Ok((expect?, obtain.map_err(Error::Jaq)?))
 }
 
 fn run_tests(file: std::fs::File) -> ExitCode {
     let lines = io::BufReader::new(file).lines().map(Result::unwrap);
-    let tests = jaq_syn::test::Parser::new(lines);
+    let tests = load::test::Parser::new(lines);
 
     let (mut passed, mut total) = (0, 0);
     for test in tests {

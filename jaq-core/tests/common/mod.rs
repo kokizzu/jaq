@@ -1,16 +1,21 @@
+use jaq_json::{Error, Val, ValR};
 use serde_json::Value;
 
-fn yields(x: jaq_interpret::Val, f: &str, ys: impl Iterator<Item = jaq_interpret::ValR>) {
-    let mut ctx = jaq_interpret::ParseCtx::new(Vec::new());
-    ctx.insert_natives(jaq_core::core());
+fn yields(x: Val, code: &str, ys: impl Iterator<Item = ValR>) {
+    use jaq_core::load::{Arena, File, Loader};
+    use jaq_core::{Compiler, Native};
 
-    let f = jaq_syn::parse(f, |p| p.module(|p| p.term()))
-        .unwrap()
-        .conv(f);
-    ctx.yields(x, f, ys)
+    let arena = Arena::default();
+    let loader = Loader::new([]);
+    let path = "".into();
+    let modules = loader.load(&arena, File { path, code }).unwrap();
+    let filter = Compiler::<_, Native<_>>::default()
+        .compile(modules)
+        .unwrap();
+    filter.yields(x, ys)
 }
 
-pub fn fail(x: Value, f: &str, err: jaq_interpret::Error) {
+pub fn fail(x: Value, f: &str, err: Error) {
     yields(x.into(), f, core::iter::once(Err(err)))
 }
 
@@ -24,7 +29,7 @@ pub fn gives<const N: usize>(x: Value, f: &str, ys: [Value; N]) {
 
 #[macro_export]
 macro_rules! yields {
-    ($func_name:ident, $filter:expr, $output: expr) => {
+    ($func_name:ident, $filter:expr, $output:expr) => {
         #[test]
         fn $func_name() {
             give(json!(null), $filter, json!($output))
